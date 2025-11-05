@@ -3,30 +3,51 @@ package server;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * ChatServer with:
+ *  - LOGIN / REGISTER (same style as your previous file)
+ *  - MSG #general <text>
+ *  - DM <user> <text>
+ *  - USERS
+ *  - QUIT
+ *  - ATTACH / DATA / ATTACH_END (file relay; General + DM)
+ *
+ * Protocol additions (Client -> Server):
+ *   ATTACH #general <filename> <size>
+ *   ATTACH <user> <filename> <size>
+ *   DATA <base64>
+ *   ATTACH_END
+ *
+ * Server -> Client during relay:
+ *   FILE <id> <from> #general <filename> <size>
+ *   FILE <id> <from> [to <peer>] <filename> <size>   // echo to sender (DM)
+ *   FILE <id> <from> <filename> <size>               // to DM recipient
+ *   FILE_DATA <id> <base64>
+ *   FILE_END <id>
+ */
 public class ChatServer {
     private final int port;
 
-    // online clients: username -> session
+    // Online sessions
     private final Map<String, ClientSession> clients = new ConcurrentHashMap<>();
 
-    // user credentials (username -> sha256(password))
+    // User credentials (username -> password-hash or token). Stays compatible with your file.
     private final Map<String, String> creds = new ConcurrentHashMap<>();
     private final File userFile = new File("users.db");
 
-    // persistence
-    private final File generalLog = new File("chat_general.log");
-    private final File dmLog      = new File("chat_dm.log");
+    // For FILE/attachment ids
+    private final AtomicLong nextId = new AtomicLong(1);
 
-    // config: require password login always
-    private static final boolean REQUIRE_PASSWORD = true;
+    // Limits
+    private static final int MAX_LINE  = 8192;   // allow big DATA lines
+    private static final int MAX_TEXT  = 500;
+    private static final String USER_RE = "[A-Za-z0-9_]{1,20}";
 
-    public ChatServer(int port) {
-        this.port = port;
-    }
+    public ChatServer(int port) { this.port = port; }
 
     // ---------- lifecycle ----------
     public void start() throws IOException {
@@ -44,19 +65,18 @@ public class ChatServer {
     private static void log(String s) { System.out.println("[SERVER] " + s); }
 
     private void broadcast(String from, String text) {
-        String line = "MSG " + from + " #general " + text;
+        String line = "MSG " + nextId.getAndIncrement() + " " + from + " #general " + text;
         for (ClientSession s : clients.values()) s.send(line);
     }
 
     private void sendDM(String from, String to, String text) {
-        ClientSession tgt = clients.get(to);
-        if (tgt != null) {
-            log("DM route: " + from + " -> " + to + " : " + text);
-            tgt.send("DM " + from + " " + text);
-        } else {
-            log("DM failed (not online): " + from + " -> " + to);
-        }
+    long id = nextId.getAndIncrement();
+    ClientSession tgt = clients.get(to);
+    if (tgt != null) {
+        tgt.send("DM " + id + " " + from + " " + text);
     }
+}
+
 
     private void removeClient(String username) {
         if (username != null) {
@@ -66,7 +86,7 @@ public class ChatServer {
         }
     }
 
-    // ---------- credentials ----------
+    // ---------- credentials (simple, same style you used) ----------
     private static String sha256(String s) {
         try {
             var md = java.security.MessageDigest.getInstance("SHA-256");
@@ -86,93 +106,41 @@ public class ChatServer {
                 if (i > 0) creds.put(line.substring(0, i), line.substring(i + 1));
             }
             log("Loaded users: " + creds.size());
-        } catch (IOException e) {
-            log("Could not load users: " + e);
-        }
+        } catch (IOException e) { log("Could not load users: " + e); }
     }
 
     private synchronized void saveUser(String user, String hash) {
         try (var fw = new FileWriter(userFile, StandardCharsets.UTF_8, true)) {
             fw.write(user + ":" + hash + System.lineSeparator());
             fw.flush();
-        } catch (IOException e) {
-            log("Could not save user: " + e);
+        } catch (IOException e) { log("Could not save user: " + e); }
+    }
+
+    // ---------- relay helpers for attachments ----------
+    private void relayFileGeneral(String from, String filename, long size, List<String> chunks) {
+        long id = nextId.getAndIncrement();
+        String head = "FILE " + id + " " + from + " #general " + filename + " " + size;
+        for (ClientSession s : clients.values()) {
+            s.send(head);
+            for (String c : chunks) s.send("FILE_DATA " + id + " " + c);
+            s.send("FILE_END " + id);
         }
     }
 
-    // ---------- history: append & read ----------
-    private synchronized void appendGeneralHistory(String from, String text) {
-        try (var fw = new FileWriter(generalLog, StandardCharsets.UTF_8, true)) {
-            fw.write(Instant.now().toEpochMilli() + "\t" + esc(from) + "\t" + esc(text) + System.lineSeparator());
-        } catch (IOException e) { log("Failed to write general log: " + e); }
-    }
-
-    private synchronized void appendDMHistory(String from, String to, String text) {
-        try (var fw = new FileWriter(dmLog, StandardCharsets.UTF_8, true)) {
-            fw.write(Instant.now().toEpochMilli() + "\t" + esc(from) + "\t" + esc(to) + "\t" + esc(text) + System.lineSeparator());
-        } catch (IOException e) { log("Failed to write dm log: " + e); }
-    }
-
-    private String esc(String s) {
-        // simple escaping for tabs/newlines
-        return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "");
-    }
-
-    private String unesc(String s) {
-        return s.replace("\\t", "\t").replace("\\n", "\n").replace("\\\\", "\\");
-    }
-
-    private List<String[]> readLastGeneral(int n) {
-        List<String[]> rows = new ArrayList<>();
-        if (!generalLog.exists()) return rows;
-        try (var br = new BufferedReader(new FileReader(generalLog, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                String[] parts = line.split("\t", 3);
-                if (parts.length == 3) rows.add(parts);
-            }
-        } catch (IOException e) { log("Failed to read general log: " + e); }
-        int from = Math.max(0, rows.size() - n);
-        return rows.subList(from, rows.size());
-    }
-
-    private List<String[]> readLastDMFor(String user, int n) {
-        // return last n DMs where from==user OR to==user
-        List<String[]> rows = new ArrayList<>();
-        if (!dmLog.exists()) return rows;
-        try (var br = new BufferedReader(new FileReader(dmLog, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                String[] parts = line.split("\t", 4);
-                if (parts.length == 4) {
-                    String from = unesc(parts[1]);
-                    String to   = unesc(parts[2]);
-                    if (from.equals(user) || to.equals(user)) rows.add(parts);
-                }
-            }
-        } catch (IOException e) { log("Failed to read dm log: " + e); }
-        int fromIdx = Math.max(0, rows.size() - n);
-        return rows.subList(fromIdx, rows.size());
-    }
-
-    private List<String[]> readLastDMBetween(String a, String b, int n) {
-        List<String[]> rows = new ArrayList<>();
-        if (!dmLog.exists()) return rows;
-        try (var br = new BufferedReader(new FileReader(dmLog, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                String[] parts = line.split("\t", 4);
-                if (parts.length == 4) {
-                    String from = unesc(parts[1]);
-                    String to   = unesc(parts[2]);
-                    if ((from.equals(a) && to.equals(b)) || (from.equals(b) && to.equals(a))) {
-                        rows.add(parts);
-                    }
-                }
-            }
-        } catch (IOException e) { log("Failed to read dm log: " + e); }
-        int fromIdx = Math.max(0, rows.size() - n);
-        return rows.subList(fromIdx, rows.size());
+    private void relayFileDm(String from, String to, String filename, long size, List<String> chunks) {
+        long id = nextId.getAndIncrement();
+        ClientSession tgt = clients.get(to);
+        ClientSession me  = clients.get(from);
+        if (tgt != null) {
+            tgt.send("FILE " + id + " " + from + " " + filename + " " + size);
+            for (String c : chunks) tgt.send("FILE_DATA " + id + " " + c);
+            tgt.send("FILE_END " + id);
+        }
+        if (me != null) {
+            me.send("FILE " + id + " " + from + " [to " + to + "] " + filename + " " + size);
+            for (String c : chunks) me.send("FILE_DATA " + id + " " + c);
+            me.send("FILE_END " + id);
+        }
     }
 
     // ---------- per-connection handler ----------
@@ -182,6 +150,14 @@ public class ChatServer {
         private PrintWriter out;
         private BufferedReader in;
 
+        // attachment upload state (per-connection)
+        private boolean uploading = false;
+        private boolean uploadIsGeneral = false;
+        private String  uploadPeer = null;
+        private String  uploadFile = null;
+        private long    uploadSize = 0;
+        private final List<String> uploadChunks = new ArrayList<>();
+
         ClientHandler(Socket socket) { this.socket = socket; }
 
         @Override public void run() {
@@ -189,90 +165,91 @@ public class ChatServer {
                 in  = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
                 out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
 
-                out.println("OK Welcome. Use: REGISTER <user> <pass>  or  LOGIN <user> <pass>");
+                out.println("OK Welcome. Use: REGISTER <user> <pass>  or  LOGIN <user> [pass]");
 
                 String line;
                 while ((line = in.readLine()) != null) {
+                    if (line.length() > MAX_LINE) { out.println("ERR line too long"); continue; }
                     line = line.trim();
                     if (line.isEmpty()) continue;
-                    if (line.length() > 600) { out.println("ERR line too long"); continue; }
+
+                    // If currently in upload mode, only allow DATA / ATTACH_END
+                    if (uploading) {
+                        if (line.startsWith("DATA ")) {
+                            String base64 = line.substring(5).trim();
+                            if (!base64.isEmpty()) uploadChunks.add(base64);
+                            else out.println("ERR DATA requires payload");
+                            continue;
+                        } else if ("ATTACH_END".equalsIgnoreCase(line)) {
+                            if (uploadIsGeneral) relayFileGeneral(username, uploadFile, uploadSize, uploadChunks);
+                            else                 relayFileDm(username, uploadPeer, uploadFile, uploadSize, uploadChunks);
+                            out.println("OK file sent");
+                            // reset upload state
+                            uploading = false;
+                            uploadIsGeneral = false;
+                            uploadPeer = null;
+                            uploadFile = null;
+                            uploadSize = 0;
+                            uploadChunks.clear();
+                            continue;
+                        } else {
+                            out.println("ERR currently uploading; send DATA <base64> or ATTACH_END");
+                            continue;
+                        }
+                    }
 
                     String[] parts = line.split("\\s+", 3); // cmd, arg1, rest
                     String cmd = parts[0].toUpperCase(Locale.ROOT);
 
                     switch (cmd) {
                         case "REGISTER": {
-                            // REGISTER <user> <pass>
                             if (parts.length < 3) { out.println("ERR usage: REGISTER <user> <pass>"); break; }
-                        
                             String u = parts[1].trim();
                             String p = parts[2].trim();
-                        
-                            if (!u.matches("[A-Za-z0-9_]{1,20}")) { out.println("ERR invalid username"); break; }
-                            if (p.isBlank())                      { out.println("ERR password required"); break; }
-                            if (creds.containsKey(u))             { out.println("ERR username exists"); break; }
-                        
-                            String h = sha256(p);
+                            if (!u.matches(USER_RE)) { out.println("ERR invalid username"); break; }
+                            if (p.isBlank())         { out.println("ERR password required"); break; }
+                            if (creds.containsKey(u)){ out.println("ERR username exists"); break; }
+                            String h = sha256(p); // simple hash (keep consistent with your earlier file)
                             creds.put(u, h);
                             saveUser(u, h);
-                            log("REGISTER ok: " + u);
                             out.println("OK registered " + u);
                             break;
                         }
-                        
 
                         case "LOGIN": {
-                            // require password
                             if (username != null) { out.println("ERR already logged in"); break; }
-                            if (parts.length < 3) { out.println("ERR usage: LOGIN <user> <pass>"); break; }
-
+                            if (parts.length < 2) { out.println("ERR usage: LOGIN <user> [pass]"); break; }
                             String u = parts[1];
-                            String pass = parts[2];
+                            String pass = (parts.length >= 3) ? parts[2] : null;
+                            if (!u.matches(USER_RE)) { out.println("ERR invalid username"); break; }
 
-                            if (!u.matches("[A-Za-z0-9_]{1,20}")) { out.println("ERR invalid username"); break; }
-                            if (REQUIRE_PASSWORD || !creds.isEmpty()) {
-                                String stored = creds.get(u);
-                                if (stored == null) { log("LOGIN fail unknown: " + u); out.println("ERR unknown user"); break; }
-                                if (!stored.equals(sha256(pass))) { log("LOGIN fail badpass: " + u); out.println("ERR bad password"); break; }
+                            boolean credentialedMode = !creds.isEmpty();
+                            if (!credentialedMode) {
+                                if (clients.containsKey(u)) { out.println("ERR username taken"); break; }
+                                username = u;
+                                clients.put(username, new ClientSession(username, out));
+                                out.println("OK logged in as " + username);
+                                broadcast("server", username + " joined the chat");
+                                break;
                             }
-
+                            String stored = creds.get(u);
+                            if (stored == null) { out.println("ERR unknown user"); break; }
+                            if (pass == null || !stored.equals(sha256(pass))) { out.println("ERR bad password"); break; }
                             if (clients.containsKey(u)) { out.println("ERR user already online"); break; }
 
                             username = u;
                             clients.put(username, new ClientSession(username, out));
-                            log("LOGIN ok: " + username);
                             out.println("OK logged in as " + username);
                             broadcast("server", username + " joined the chat");
-
-                            // auto history replay
-                            out.println("OK history start");
-                            for (String[] r : readLastGeneral(50)) {
-                                String from = unesc(r[1]);
-                                String text = unesc(r[2]);
-                                out.println("MSG " + from + " #general " + text);
-                            }
-                            for (String[] r : readLastDMFor(username, 50)) {
-                                String from = unesc(r[1]);
-                                String to   = unesc(r[2]);
-                                String text = unesc(r[3]);
-                                if (to.equals(username)) {
-                                    out.println("DM " + from + " " + text);
-                                } else if (from.equals(username)) {
-                                    out.println("DM " + username + " [to " + to + "] " + text);
-                                }
-                            }
-                            out.println("OK history end");
                             break;
                         }
 
                         case "MSG": {
                             if (!ensureLogin()) break;
                             if (parts.length < 3) { out.println("ERR usage: MSG #general <text>"); break; }
-                            String target = parts[1];
-                            if (!"#general".equals(target)) { out.println("ERR only #general is supported"); break; }
+                            if (!"#general".equals(parts[1])) { out.println("ERR only #general is supported"); break; }
                             String text = parts[2];
-                            if (text.length() > 500) { out.println("ERR message too long"); break; }
-                            appendGeneralHistory(username, text);
+                            if (text.length() > MAX_TEXT) { out.println("ERR message too long"); break; }
                             broadcast(username, text);
                             break;
                         }
@@ -280,18 +257,13 @@ public class ChatServer {
                         case "DM": {
                             if (!ensureLogin()) break;
                             if (parts.length < 3) { out.println("ERR usage: DM <user> <text>"); break; }
-                            String to   = parts[1].trim();
-                            String text = parts[2].trim();
+                            String[] p2 = parts[2].split("\\s+", 2);
+                            if (p2.length < 2) { out.println("ERR usage: DM <user> <text>"); break; }
+                            String to = p2[0];
+                            String text = p2[1];
                             if (!clients.containsKey(to)) { out.println("ERR user not online"); break; }
-                            if (text.isEmpty())          { out.println("ERR empty message"); break; }
-                            if (text.length() > 500)     { out.println("ERR message too long"); break; }
-
-                            appendDMHistory(username, to, text);
-                            // deliver and echo
+                            if (text.length() > MAX_TEXT) { out.println("ERR message too long"); break; }
                             sendDM(username, to, text);
-                            ClientSession me = clients.get(username);
-                            if (me != null) me.send("DM " + username + " [to " + to + "] " + text);
-
                             out.println("OK dm sent to " + to);
                             break;
                         }
@@ -303,38 +275,37 @@ public class ChatServer {
                             break;
                         }
 
-                        case "HISTORY": {
+                        case "ATTACH": {
                             if (!ensureLogin()) break;
-                            if (parts.length < 2) { out.println("ERR usage: HISTORY #general <n> | HISTORY DM <user> <n>"); break; }
-                            String rest = parts[1] + (parts.length == 3 ? " " + parts[2] : "");
-                            String[] hp = rest.split("\\s+");
-                            try {
-                                if (hp.length >= 2 && "#general".equalsIgnoreCase(hp[0])) {
-                                    int n = Integer.parseInt(hp[1]);
-                                    for (String[] r : readLastGeneral(n)) {
-                                        out.println("MSG " + unesc(r[1]) + " #general " + unesc(r[2]));
-                                    }
-                                    out.println("OK history end");
-                                } else if (hp.length >= 3 && "DM".equalsIgnoreCase(hp[0])) {
-                                    String peer = hp[1];
-                                    int n = Integer.parseInt(hp[2]);
-                                    for (String[] r : readLastDMBetween(username, peer, n)) {
-                                        String from = unesc(r[1]);
-                                        String to   = unesc(r[2]);
-                                        String text = unesc(r[3]);
-                                        if (to.equals(username)) {
-                                            out.println("DM " + from + " " + text);
-                                        } else if (from.equals(username)) {
-                                            out.println("DM " + username + " [to " + peer + "] " + text);
-                                        }
-                                    }
-                                    out.println("OK history end");
-                                } else {
-                                    out.println("ERR usage: HISTORY #general <n> | HISTORY DM <user> <n>");
-                                }
-                            } catch (NumberFormatException nfe) {
-                                out.println("ERR history count must be a number");
+                            if (parts.length < 3) {
+                                out.println("ERR usage: ATTACH (#general|<user>) <filename> <size>");
+                                break;
                             }
+                            String target = parts[1];
+                            String[] more = parts[2].split("\\s+");
+                            if (more.length < 2) {
+                                out.println("ERR ATTACH missing filename/size");
+                                break;
+                            }
+                            String filename = more[0];
+                            long size;
+                            try { size = Long.parseLong(more[1]); }
+                            catch (Exception e) { out.println("ERR size must be number"); break; }
+
+                            uploadFile = filename;
+                            uploadSize = size;
+                            uploadChunks.clear();
+
+                            if ("#general".equals(target)) {
+                                uploadIsGeneral = true;
+                                uploadPeer = null;
+                            } else {
+                                if (!clients.containsKey(target)) { out.println("ERR user not online"); break; }
+                                uploadIsGeneral = false;
+                                uploadPeer = target;
+                            }
+                            uploading = true;
+                            out.println("OK attach begin; send DATA <base64> then ATTACH_END");
                             break;
                         }
 
@@ -373,7 +344,7 @@ public class ChatServer {
         if (args.length > 0) port = Integer.parseInt(args[0]);
         ChatServer s = new ChatServer(port);
         s.loadUsers();
-        System.out.println("[SERVER] users.db path: " + new File("users.db").getAbsolutePath());
+        System.out.println("[SERVER] users.db: " + new File("users.db").getAbsolutePath());
         s.start();
     }
 }
